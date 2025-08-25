@@ -419,73 +419,125 @@
       })();
     }
     function startEQ(){
-      if (analyser || isFile) return;
-      try{
-        const AC = window.AudioContext || window.webkitAudioContext;
-        audioCtx = audioCtx || new AC();
-        if (!srcNode) {
-          srcNode  = audioCtx.createMediaElementSource(audio);
-          srcNode.connect(audioCtx.destination);
-        }
-        analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 256;
-        srcNode.connect(analyser);
-        data = new Uint8Array(analyser.frequencyBinCount);
-        const idxs=[2,4,8,12];
-        const loop=()=>{
-          analyser.getByteFrequencyData(data);
-          bars.forEach((b,i)=>{ const v=data[idxs[i]]||0; b.style.height=(4+(v/255)*16)+'px'; });
-          eqRaf=requestAnimationFrame(loop);
-        };
-        eqRaf=requestAnimationFrame(loop);
-      }catch(e){
-        startFakeEQ();
-      }
+  if (analyser || isFile) return;
+  try{
+    const AC = window.AudioContext || window.webkitAudioContext;
+    audioCtx = audioCtx || new AC();
+
+    if (!srcNode) {
+      srcNode  = audioCtx.createMediaElementSource(audio);
+      // send audio to speakers
+      srcNode.connect(audioCtx.destination);
     }
 
-    // === Music-reactive blob pulse (BPM + energy) ===
-    const blobs = Array.from(document.querySelectorAll('.blob'));
-    const offsets = blobs.map(()=> Math.random()*Math.PI*2);
-    let rafPulse;
-    function getEnergy(){
-      if (analyser && data) {
-        let sum=0, n=0;
-        for (let i=2; i<18; i++){ sum += data[i]; n++; }
-        return (sum / (n*255)); // 0..1
-      }
-      return 0.5; // fallback on file://
-    }
-    function pulseLoop(){
-      const t = audio.currentTime || performance.now()/1000;
-      const bpm = songs[currentIndex].bpm;
-      const beatPeriod = 60 / bpm;
-      const beat = Math.sin((t / beatPeriod) * Math.PI * 2);
-      const beatAmp = (beat + 1) / 2; // 0..1
-      const energy = getEnergy();
+    // analyser chain with bass emphasis
+    const lowpass = audioCtx.createBiquadFilter();
+    lowpass.type = 'lowpass';
+    lowpass.frequency.value = 180;   // focus on kick/bass area
+    lowpass.Q.value = 0.7;
 
-      const base = 1;
-      const eAmt = 0.06; // energy contribution
-      const bAmt = 0.08; // beat contribution
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024;         // higher resolution for smoother envelope
+    data = new Uint8Array(analyser.frequencyBinCount);
+    timeData = new Uint8Array(analyser.fftSize);
 
-      blobs.forEach((el,i)=>{
-        const jitter = 0.015 * Math.sin(t*0.7 + offsets[i]);
-        const scale = base + (energy * eAmt) + (beatAmp * bAmt) + jitter;
-        el.style.setProperty('--pulse', scale.toFixed(3));
-        el.style.opacity = 0.28 + 0.10 * beatAmp;
-      });
+    // src -> lowpass -> analyser
+    srcNode.connect(lowpass);
+    lowpass.connect(analyser);
 
-      rafPulse = requestAnimationFrame(pulseLoop);
-    }
+    const idxs=[2,4,8,12];
+    const loop=()=>{                  // keep small EQ bars alive
+      analyser.getByteFrequencyData(data);
+      bars.forEach((b,i)=>{ const v=data[idxs[i]]||0; b.style.height=(4+(v/255)*16)+'px'; });
+      eqRaf=requestAnimationFrame(loop);
+    };
+    eqRaf=requestAnimationFrame(loop);
+  }catch(e){
+    startFakeEQ();
+  }
+}
 
-    // Kick everything on first user gesture (to satisfy autoplay policies)
-    window.addEventListener('pointerdown', ()=>{
-      if (isFile) { startFakeEQ(); } else { try{ audioCtx && audioCtx.resume(); }catch{} startEQ(); }
-      cancelAnimationFrame(rafPulse); rafPulse = requestAnimationFrame(pulseLoop);
-    }, { once:true });
+    // === Music-reactive blob pulse (Waveform + Bass + BPM) ===
+const blobs = Array.from(document.querySelectorAll('.blob'));
+const offsets = blobs.map(()=> Math.random()*Math.PI*2);
+
+let rafPulse;
+let env = 0;             // smoothed loudness envelope
+let bassEnv = 0;         // smoothed bass emphasis
+let timeData;            // filled in startEQ()
+
+function lerp(a,b,t){ return a + (b-a)*t; }
+function clamp(x,min,max){ return Math.min(max, Math.max(min, x)); }
+
+// compute RMS envelope from time-domain waveform (-1..1)
+function rmsFromTimeDomain(){
+  if (!analyser || !timeData) return 0.5;
+  analyser.getByteTimeDomainData(timeData);
+  let sum = 0;
+  for (let i=0;i<timeData.length;i++){
+    const v = (timeData[i]-128)/128; // normalize
+    sum += v*v;
+  }
+  return Math.sqrt(sum / timeData.length); // 0..~1
+}
+
+// quick bass estimate from low frequency bins
+function bassEnergy(){
+  if (!analyser || !data) return 0.5;
+  analyser.getByteFrequencyData(data);
+  let sum = 0, n = 0;
+  // emphasize very low bins
+  for (let i=1;i<18;i++){ sum += data[i]; n++; }
+  return (sum / (n*255)); // 0..1
+}
+
+function pulseLoop(){
+  const t = audio.currentTime || performance.now()/1000;
+  const bpm = songs[currentIndex].bpm;
+  const beatPeriod = 60 / bpm;
+
+  // beat accent (waveshaped to feel like a thump)
+  const phase = (t % beatPeriod) / beatPeriod;     // 0..1
+  const beat = Math.sin(phase * Math.PI * 2);      // -1..1
+  const beatAmp = Math.max(0, beat);               // 0..1
+  const thump = Math.pow(beatAmp, 2.2);            // sharper front
+
+  // live envelopes
+  const rms = rmsFromTimeDomain();                 // ~0..1
+  const bass = bassEnergy();                       // 0..1
+
+  // smooth
+  env = lerp(env, rms, 0.18);
+  bassEnv = lerp(bassEnv, bass, 0.22);
+
+  // mix: base loudness + bass punch + beat accent
+  const energy = clamp( (env*0.65) + (bassEnv*0.55) + (thump*0.5), 0, 1 );
+
+  // map to transform + opacity
+  const base = 1.00;
+  const eAmt = 0.12;   // envelope contribution to scale
+  const bAmt = 0.10;   // beat contribution to scale
+
+  blobs.forEach((el,i)=>{
+    const jitter = 0.012 * Math.sin(t*0.9 + offsets[i]);
+    const scale = base + (energy*eAmt) + (thump*bAmt) + jitter;
+    el.style.setProperty('--pulse', scale.toFixed(3));
+    el.style.opacity = (0.24 + 0.18*energy).toFixed(3);
+  });
+
+  rafPulse = requestAnimationFrame(pulseLoop);
+}
+
+// Kick everything on first user gesture (already present)
+window.addEventListener('pointerdown', ()=>{
+  if (isFile) { startFakeEQ(); } else { try{ audioCtx && audioCtx.resume(); }catch{} startEQ(); }
+  cancelAnimationFrame(rafPulse); rafPulse = requestAnimationFrame(pulseLoop);
+}, { once:true });
 
     // init
     loadSong(0);
   </script>
 </body>
 </html>
+
 
